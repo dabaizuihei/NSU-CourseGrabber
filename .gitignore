@@ -1,0 +1,12 @@
+# 真实配置含 token 等账号凭证，切勿提交
+config.toml
+
+# 运行日志
+logs/
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc

@@ -1,0 +1,31 @@
+# 成都东软学院抢课脚本配置模板
+# 复制本文件为 config.toml，填入你自己的值后使用
+# 如果使用出现任何问题，请首先仔细仔细仔细阅读Readme里面的说明
+
+# 教务系统地址[一般不用更改]
+base_url = "https://xk.dean.nsu.edu.cn/xsxk"
+
+# 登陆令牌
+token = "YOUR_TOKEN_HERE"
+
+# 轮次ID
+batch_id = "YOUR_BATCH_ID_HERE"
+
+# 教学班类型
+teaching_class_type = "TYKC"
+
+# 校区代码
+campus = "1"
+
+[course]
+KCH = "YOUR_KCH"
+KXH = "YOUR_KXH"
+
+[grab]
+grab_time = "2026-09-14 13:00:00"
+pre_start_seconds = 5
+retry_interval = 0.5
+max_attempts = 1200
+secret_refresh_every = 3
+end_time = "2026-09-14 13:10:00"
+request_timeout = 15
