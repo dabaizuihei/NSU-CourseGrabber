@@ -29,3 +29,5 @@ max_attempts = 1200
 secret_refresh_every = 3
 end_time = "2026-09-14 13:10:00"
 request_timeout = 15
+confirm_timeout = 8
+max_unconfirmed = 3

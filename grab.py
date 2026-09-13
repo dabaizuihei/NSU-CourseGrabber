@@ -18,8 +18,9 @@
      （避免本机时间不准导致开抢时机偏晚）
   3. 等待到 grab_time - pre_start_seconds 时刻，提前进入高频试探
   4. 循环：实时查询课程列表获取最新 secretVal → 提交选课 → 处理结果
-  5. 成功（code=200 进入选课队列）即停止；失败按 retry_interval 重试，
-     直到 max_attempts 或 end_time
+  5. 提交返回 200（仅代表进入选课队列）后，轮询「已选课程」列表二次确认，
+     确认选上才停止；入队未确认不判成功，而是继续复查/重新提交，
+     直到确认成功、连续多次未确认、达到 max_attempts 或 end_time
 
 【错误提示约定】
   脚本对常见失败原因（token 失效、网络异常、课程未找到、时间未到等）
@@ -51,6 +52,9 @@ LOG_DIR = os.path.join(BASE_DIR, "logs")
 # 模拟浏览器 UA，部分服务器会拦截无 UA 或脚本特征的请求
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
+
+# 等待阶段重新校准时钟偏移的间隔（秒），防止长时间挂机后本地时钟漂移
+TIME_RECALIBRATE_INTERVAL = 300
 
 
 # ----------------------------------------------------------------
@@ -228,6 +232,22 @@ class Grabber:
         return datetime.datetime.fromtimestamp(
             (time.time() * 1000 + self.offset_ms) / 1000.0)
 
+    def try_recalibrate(self):
+        """
+        等待期间定期重新校准时钟偏移（长时间挂机时本地时钟可能漂移）。
+        与 calibrate_time 不同：失败只警告、不退出，避免等待阶段因
+        一次网络波动就终止整个抢课任务。
+        """
+        server_ms = self.server_now_ms()
+        if server_ms is None:
+            self.log.warning("重新校准时间失败（网络波动？），继续沿用上次偏移量。")
+            return False
+        local_ms = int(time.time() * 1000)
+        self.offset_ms = server_ms - local_ms
+        self.log.info("等待期间重新校准: 时间偏移 %+.1f 秒",
+                      self.offset_ms / 1000.0)
+        return True
+
     @staticmethod
     def _fmt_ms(ms):
         return datetime.datetime.fromtimestamp(ms / 1000.0).strftime(
@@ -351,13 +371,15 @@ class Grabber:
         提交返回 200 后，轮询 /elective/select 确认目标课是否真的进入已选列表。
         金智的 /add 只是把请求送入选课队列，真正选上需服务端处理；
         这里等待几秒做二次确认，避免把「进入队列」误判为「选上」。
+        无论 timeout 多小都至少完整查询一次，避免配置为 0 时直接误判。
         """
         deadline = time.time() + timeout
-        while time.time() < deadline:
+        while True:
             if self.already_selected():
                 return True
+            if time.time() >= deadline:
+                return False
             time.sleep(0.5)
-        return False
 
     # ---------------------- 主流程 ----------------------
 
@@ -370,6 +392,8 @@ class Grabber:
         interval = float(cfg.get("retry_interval", 0.5))
         max_attempts = int(cfg.get("max_attempts", 1200))
         refresh_every = int(cfg.get("secret_refresh_every", 3))
+        confirm_timeout = float(cfg.get("confirm_timeout", 8))
+        max_unconfirmed = int(cfg.get("max_unconfirmed", 3))
 
         # 打印本次任务概要
         self.log.info("=" * 60)
@@ -379,14 +403,16 @@ class Grabber:
                       grab_dt.strftime("%Y-%m-%d %H:%M:%S"), pre_start)
         self.log.info("重试间隔: %s 秒 | 最大尝试: %s 次",
                       interval, max_attempts)
+        self.log.info("入队确认: 提交后等待 %s 秒复查已选列表，连续 %s 次未确认则退出",
+                      confirm_timeout, max_unconfirmed)
         self.log.info("=" * 60)
 
         # 1. 网络检查 + 服务器时间校准
         self.calibrate_time()
 
         # 2. 等待到开抢前 pre_start 秒（此阶段只打印倒计时，不发请求）
-        start_ms = int(grab_dt.timestamp() * 1000)
         last_print = -1
+        last_cal = time.time()   # 上次时间校准时刻（用于长时间等待期间重校准）
         while True:
             now_server = self.server_now()
             remain = (grab_dt - now_server).total_seconds()
@@ -396,6 +422,11 @@ class Grabber:
                 self.log.warning("已超过截止时间 %s，脚本退出。",
                                  end_dt.strftime("%Y-%m-%d %H:%M:%S"))
                 sys.exit(0)
+            # 长时间挂机等待时本地时钟可能漂移，每 5 分钟重新校准一次；
+            # 仅在距开抢还有 60 秒以上时执行，避免影响最后的开抢时机
+            if remain > 60 and time.time() - last_cal >= TIME_RECALIBRATE_INTERVAL:
+                self.try_recalibrate()
+                last_cal = time.time()
             # 控制倒计时打印频率：60 秒以上每 30 秒打一次，60 秒内每 10 秒一次
             if remain >= 60:
                 print_interval = 30
@@ -416,6 +447,7 @@ class Grabber:
         last_refresh = 0
         target_cache = None
         list_fail_streak = 0   # 连续获取课程列表失败的次数（用于判断 token 失效）
+        unconfirmed = 0        # 连续「入队但未确认选上」的次数
         while attempt < max_attempts:
             attempt += 1
             now_server = self.server_now()
@@ -426,10 +458,14 @@ class Grabber:
                 self.log.warning("若已开抢仍一直失败，请查看上方日志中的原因提示")
                 sys.exit(2)
 
-            # 第 1 次尝试前先查一下已选列表，防止重复提交
-            if attempt == 1:
+            # 第 1 次尝试前先查已选列表，防止重复提交；
+            # 此前若有「入队但未确认」的提交，每轮也先复查（队列可能已处理完成）
+            if attempt == 1 or unconfirmed > 0:
                 if self.already_selected():
-                    self.log.info("目标课程已在已选列表中，无需抢课，脚本退出。")
+                    if attempt == 1:
+                        self.log.info("目标课程已在已选列表中，无需抢课，脚本退出。")
+                    else:
+                        self.log.info("✅ 此前入队的请求已在已选课程列表中确认到，抢课成功！")
                     sys.exit(0)
 
             # 定期刷新课程信息（secretVal 会变，必须用最新的）
@@ -466,32 +502,48 @@ class Grabber:
             msg = r.get("msg", "")
             tag = "第 {:>4} 次".format(attempt)
 
-            # 成功：进入选课队列。金智的 /add 只是入队，真正选上以
-            # 「已选课程」列表为准，因此这里做二次确认，避免假成功。
-            if code == 200:
-                self.log.info("%s ✅ 提交返回 200，已进入选课队列！课程: %s",
-                              tag, target_cache.get("name", ""))
-                self.log.info("教学班: %s", target_cache["JXBID"])
-                if self.confirm_selected(timeout=8):
-                    self.log.info("✅ 已在已选课程列表中确认，抢课成功！")
-                    sys.exit(0)
-                self.log.warning("⚠️ 已进入队列，但未在已选列表中确认到（可能仍在排队或已满员）。")
-                self.log.warning("说明: 金智 /add 只入队，最终结果以教务系统「已选课程」为准。")
-                self.log.warning("建议: 稍后登录选课系统核对；若未选上，可更新 token 重新运行本脚本。")
-                sys.exit(0)
-
-            # code=301：服务器要求二次确认（如超容量/跨年级等），自动带 isConfirm 重提交
+            # code=301：服务器要求二次确认（如超容量/跨年级等），自动带 isConfirm
+            # 重提交，重提交结果与首次提交共用下方 code==200 的确认逻辑
             if code == 301:
                 self.log.info("%s ⚠️ 服务器要求确认（%s），自动带 isConfirm 重提交…",
                               tag, msg)
                 r2 = self.submit(target_cache["JXBID"],
                                  target_cache["secretVal"],
                                  is_confirm=True)
-                if r2.get("code") == 200:
-                    self.log.info("%s ✅ 确认后提交成功！课程: %s",
-                                  tag, target_cache.get("name", ""))
-                    sys.exit(0)
                 code, msg = r2.get("code"), r2.get("msg", "")
+
+            # 提交返回 200 仅代表请求进入选课队列，真正选上以「已选课程」
+            # 列表为准。因此入队后必须二次确认；确认不到不判成功、不退出，
+            # 而是继续复查已选列表并重新提交，避免把「进入队列」误判为「选上」。
+            if code == 200:
+                self.log.info("%s ✅ 提交返回 200，已进入选课队列！课程: %s",
+                              tag, target_cache.get("name", ""))
+                self.log.info("教学班: %s", target_cache["JXBID"])
+                if self.confirm_selected(timeout=confirm_timeout):
+                    self.log.info("✅ 已在已选课程列表中确认，抢课成功！")
+                    sys.exit(0)
+                # 入队但未确认：可能是队列仍在处理，也可能名额已满排队失败
+                unconfirmed += 1
+                self.log.warning("%s ⚠️ 入队后 %s 秒未在已选列表确认到（第 %s/%s 次），"
+                                 "继续复查重试…", tag, confirm_timeout,
+                                 unconfirmed, max_unconfirmed)
+                if unconfirmed >= max_unconfirmed:
+                    # 退出前再做一次较长的复查：最后一次入队仍在服务端队列
+                    # 处理中，给它更长时间确认，避免把最终会成功的入队误判失败
+                    self.log.warning("连续 %s 次入队未即时确认，做最后一次复查（最长 %s 秒）…",
+                                     unconfirmed, confirm_timeout * 4)
+                    if self.confirm_selected(timeout=confirm_timeout * 4):
+                        self.log.info("✅ 最终复查确认已选上，抢课成功！")
+                        sys.exit(0)
+                    self.log.error("连续 %s 次入队均未能确认选上，可能名额已满或队列处理异常。",
+                                   unconfirmed)
+                    self.log.error("说明: 金智 /add 只入队，最终结果以教务系统「已选课程」为准。")
+                    self.log.error("处理建议: 稍后登录选课系统人工核对；若未选上，"
+                                   "可更新 token 重新运行本脚本。")
+                    sys.exit(5)
+                target_cache = None   # 下轮强制重新获取最新 secretVal 再提交
+                time.sleep(interval)
+                continue
 
             # 登录态失效：明确提示并退出
             if code in (401, 402, 403):
